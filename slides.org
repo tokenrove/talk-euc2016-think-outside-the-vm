@@ -1,0 +1,62 @@
+#+REVEAL_ROOT: http://cdn.jsdelivr.net/reveal.js/3.0.0/
+#+REVEAL_THEME: white
+#+OPTIONS: num:nil
+#+OPTIONS: toc:nil
+#+TITLE: What if your NIF goes adrift?
+#+AUTHOR: Julian Squires
+#+EMAIL:
+
+#+BEGIN_HTML
+<style type="text/css">
+.reveal pre {
+    width: 100%;
+    border: none;
+    box-shadow: none;
+}
+
+.reveal blockquote {
+    text-align: left;
+    border: none;
+    box-shadow: none;
+}
+</style>
+#+END_HTML
+
+* Profiling in Prod is Hard
+
+- In-VM tools interfere with system operation
+- it's difficult to simulate system under load outside of prod
+
+* Using out-of-VM tools on the VM
+
+- We can use perf and other out-of-VM tools to get ideas of what we can try optimizing
+
+* Linking experiments
+
+- now we can conduct experiments in the small, and try to demonstrate a correlation
+
+* Idea
+
+- slow things down to demonstrate correlations before we try to speed things up
+
+* Integrating perf and Erlang
+
+- flamegraphs here
+
+* How bad is the skid?
+
+- measurements here
+
+* Other tricks
+
+- comparing allocator stats w/mmap sizes, fragmentation
+- printing the current stack on each scheduler
+- kcov for coverage in production
+
+* Next Steps
+
+contribute: ~github.com/tokenrove/~
+
+feedback: ~julian@cipht.net~
+
+[[./logo_adgear_smaller.png]]
