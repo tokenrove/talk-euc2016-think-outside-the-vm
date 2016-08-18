@@ -25,7 +25,9 @@
 * Profiling in Prod is Hard
 
 - In-VM tools interfere with system operation
+  - caveat: OTP 19 tracing facilities should improve the situation, and will only get better
 - it's difficult to simulate system under load outside of prod
+
 
 * Using out-of-VM tools on the VM
 
@@ -34,6 +36,8 @@
 * Linking experiments
 
 - now we can conduct experiments in the small, and try to demonstrate a correlation
+- identify KPI: what is measured improves
+- beware Goodhart's Law: when a measure becomes a target, it ceases to be a good measure
 
 * Idea
 
@@ -46,7 +50,10 @@
 * How bad is the skid?
 
 - measurements here
+- all tools can print an estimate
 
+
+* ftrace'ing mmap instead of using strace
 * Other tricks
 
 - comparing allocator stats w/mmap sizes, fragmentation
