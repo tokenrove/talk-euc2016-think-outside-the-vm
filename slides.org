@@ -60,9 +60,17 @@
 - printing the current stack on each scheduler
 - kcov for coverage in production
 
-* Next Steps
 
-contribute: ~github.com/tokenrove/~
+* Things to improve
+
+- reduce skid
+- sample less: right now we sample a lot of registers and memory that
+  we are only occasionally interested in; BPF might be able to help
+  with this at some point
+
+*
+
+contribute: ~github.com/tokenrove/extrospect-beam~
 
 feedback: ~julian@cipht.net~
 
