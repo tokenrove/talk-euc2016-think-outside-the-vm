@@ -51,7 +51,7 @@
 
 - measurements here
 - all tools can print an estimate
-
+- we can run an experiment with ptrace by comparison
 
 * ftrace'ing mmap instead of using strace
 * Other tricks
