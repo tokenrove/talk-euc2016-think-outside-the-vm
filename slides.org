@@ -2,7 +2,7 @@
 #+REVEAL_THEME: white
 #+OPTIONS: num:nil
 #+OPTIONS: toc:nil
-#+TITLE: What if your NIF goes adrift?
+#+TITLE: Think Outside the VM: Unobtrusive Measurement
 #+AUTHOR: Julian Squires
 #+EMAIL:
 
@@ -22,53 +22,230 @@
 </style>
 #+END_HTML
 
+* Think Outside the VM
+
+#+BEGIN_NOTES
+- apology for Linuxisms, x86-64-isms
+- there are probably places where DTrace makes many of these hacks
+  unnecessary; unfortunately that is not my world right now.
+#+END_NOTES
+
 * Profiling in Prod is Hard
 
+In-VM tools:
+ - fprof
+ - eep
+ - eflame
+
+All built on tracing (which is improving in OTP 19)
+
+#+BEGIN_NOTES
 - In-VM tools interfere with system operation
   - caveat: OTP 19 tracing facilities should improve the situation, and will only get better
+- In-VM tracers mostly ignore native and kernel functions
 - it's difficult to simulate system under load outside of prod
+#+END_NOTES
 
+* How far outside the VM can we go?
+
+[[https://issta2016.cispa.saarland/zero-overhead-profiling-via-em-emanations/][Callan, Robert, et al. "Zero-overhead profiling via EM emanations." Proceedings of the 25th International Symposium on Software Testing and Analysis. ACM, 2016.]]
+
+- or hardware-assisted profiling
+- neither is an option for us: our machines live in DCs outside our
+  control
 
 * Using out-of-VM tools on the VM
 
+In order of obtrusiveness:
+
+- ~perf_events~
+- hardware breakpoints
+- systemtap
+- ftrace
+- ptrace
+
+#+BEGIN_NOTES
 - We can use perf and other out-of-VM tools to get ideas of what we can try optimizing
+- Unobtrusive measurement tradeoff: our measurements are less accurate and potentially more biased
+- other benefit of perf is getting the whole picture: Erlang and native code
+#+END_NOTES
 
-* Linking experiments
+* ptrace, ~/proc/PID/mem~
 
-- now we can conduct experiments in the small, and try to demonstrate a correlation
-- identify KPI: what is measured improves
-- beware Goodhart's Law: when a measure becomes a target, it ceases to be a good measure
+- used by gdb, strace
+- has to stop processes to read from them
+- interferes badly with systems with tight latency requirements
 
-* Idea
+#+BEGIN_NOTES
+- show an example of relatively innocent ptrace'ing interfering with the BEAM
+- when network timing and scheduling are considered, seems to send
+  things into death spirals
+#+END_NOTES
 
-- slow things down to demonstrate correlations before we try to speed things up
+* ~perf_events~
 
-* Integrating perf and Erlang
+- can sample registers and stack from kernel
+- designed to be safe to use in production
+- scales itself back if it takes too much time
 
-- flamegraphs here
+#+BEGIN_NOTES
+#+END_NOTES
+
+* perf has overhead, too
+
+[[http://web.eece.maine.edu/~vweaver/projects/perf_events/overhead/][V.M. Weaver. "Self-monitoring Overhead of the Linux perf_event Performance Counter Interface", IEEE International Symposium on Performance Analysis of Systems and Software (ISPASS 2015), Philadelphia, Pennsylvania, March 2015.]]
+
+* ~process_vm_readv~
+
+- reads from another process's memory without stopping it
+- unsafe (racy), but unobtrusive
+
+* DWARF
+
+- allows us to peek into ERTS at the C level
+- libraries aren't great
+- compilers are inconsistent in what they omit
+- sometimes we have to look at the dissassembly by hand to pick out
+  the registers we want
+
+#+BEGIN_NOTES
+The existing libraries are very focused on a handful of use-cases,
+like implementing gdb and nm.
+#+END_NOTES
+
+* Generating a perf.map
+
+#+BEGIN_EXAMPLE
+7fe15be4fc48 a8 cowboy:start_http/4
+7fe15be4fcf0 a8 cowboy:start_https/4
+7fe15be4fd98 e8 cowboy:start_spdy/4
+7fe15be4fe80 38 cowboy:stop_listener/1
+7fe15be4feb8 250 cowboy:set_env/3
+7fe15be50108 68 cowboy:module_info/0
+7fe15be50170 78 cowboy:module_info/1
+7fe15be50ee0 38 cowboy_app:start/2
+7fe15be50f18 38 cowboy_app:stop/1
+7fe15be50f50 68 cowboy_app:module_info/0
+7fe15be50fb8 78 cowboy_app:module_info/1
+#+END_EXAMPLE
+
+#+BEGIN_NOTES
+Not strictly necessary, but convenient, especially for minimizing the
+modifications to the perf tool itself.
+
+The VM could do this for us.
+#+END_NOTES
+
+* How can we get Erlang stack traces intermixed with native ones?
+
+- sample registers and stack
+- unwind (printing native frames) till we find ~process_main()~
+- DWARF info (or perf sample) gives us registers that correspond to ~c_p~; also ~E~ and ~I~ if we're lucky
+- walk ~c_p->stop~ exactly as ~etp~ does
 
 * How bad is the skid?
 
+(measurements here)
+
+#+BEGIN_NOTES
 - measurements here
 - all tools can print an estimate
 - we can run an experiment with ptrace by comparison
 
+- we mostly don't care about this level of skid -- we're still getting
+  information about which process was running
+#+END_NOTES
+
+* Integrating perf and Erlang
+
+- perf already reads ~/tmp/perf-PID.map~
+- just need to intercept stack traces, explode them as discussed previously
+
+#+BEGIN_NOTES
+- flamegraphs here
+#+END_NOTES
+
+* Linking experiments
+
+#+BEGIN_NOTES
+- now we can conduct experiments in the small, and try to demonstrate a correlation
+- identify KPI: what is measured improves
+- beware Goodhart's Law: when a measure becomes a target, it ceases to be a good measure
+
+- for us, the number of bid requests per second, request time, and the
+  number of global timeouts are KPIs; can we correlate some local
+  benchmark with those metrics?
+
+- we have to keep in mind that our system is part of a complex dynamic
+  feedback loop where it may take some time for peers to regain
+  confidence in our server and send it more load
+#+END_NOTES
+
+* Beware Goodhart's Law
+
+#+BEGIN_QUOTE
+When a measure becomes a target, it ceases to be a good measure.
+ — Goodhart's Law
+#+END_QUOTE
+
+* Making benchmarks more honest
+
+#+BEGIN_QUOTE
+Why not 10x?
+  — Brendan Gregg
+#+END_QUOTE
+
+* Idea: Intentionally slow suspected paths
+
+#+BEGIN_NOTES
+- also the basis of coz profiler
+- slow things down to demonstrate correlations before we try to speed things up
+#+END_NOTES
+
+* Allocator stats
+
+- ~recon~ is nice, but can do a lot of work collecting allocator
+  statistics
+
+#+BEGIN_NOTES
+- comparing allocator stats w/mmap sizes, fragmentation
+#+END_NOTES
+
 * ftrace'ing mmap instead of using strace
+
+* Who triggers garbage collections?
+
+#+BEGIN_EXAMPLE
+erlang-blame erts_garbage_collect PID
+#+END_EXAMPLE
+
+- same as ordinary sampling, but only count processes or functions
+  seen under ~erts_garbage_collect~
+- also works with ~copy_struct~, ~erts_cmp_compound~, et cetera
+
+#+BEGIN_NOTES
+#+END_NOTES
+
+* Live demo
 * Other tricks
 
-- comparing allocator stats w/mmap sizes, fragmentation
 - printing the current stack on each scheduler
 - kcov for coverage in production
-
 
 * Things to improve
 
 - reduce skid
-- sample less: right now we sample a lot of registers and memory that
-  we are only occasionally interested in; BPF might be able to help
-  with this at some point
+- better debug info
+- sample less
+- use BPF?
 
-*
+#+BEGIN_NOTES
+right now we sample a lot of registers and memory that we are only
+occasionally interested in; BPF might be able to help with this at
+some point
+#+END_NOTES
+
+* 
 
 contribute: ~github.com/tokenrove/extrospect-beam~
 
