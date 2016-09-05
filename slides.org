@@ -1,7 +1,8 @@
 #+REVEAL_ROOT: http://cdn.jsdelivr.net/reveal.js/3.0.0/
+#+REVEAL_ROOT: file:///home/julian/build/reveal.js/
 #+REVEAL_THEME: white
-#+OPTIONS: num:nil
 #+OPTIONS: toc:nil
+#+OPTIONS: num:nil
 #+TITLE: Think Outside the VM: Unobtrusive Measurement
 #+AUTHOR: Julian Squires
 #+EMAIL:
@@ -22,15 +23,13 @@
 </style>
 #+END_HTML
 
-* Think Outside the VM
-
 #+BEGIN_NOTES
 - apology for Linuxisms, x86-64-isms
 - there are probably places where DTrace makes many of these hacks
   unnecessary; unfortunately that is not my world right now.
 #+END_NOTES
 
-* Profiling in Prod is Hard
+* Inside the VM
 
 In-VM tools:
  - fprof
@@ -38,6 +37,10 @@ In-VM tools:
  - eflame
 
 All built on tracing (which is improving in OTP 19)
+
+* Profiling in Prod is Hard
+
+[[./htop-lax.png]]
 
 #+BEGIN_NOTES
 - In-VM tools interfere with system operation
@@ -58,11 +61,10 @@ All built on tracing (which is improving in OTP 19)
 
 In order of obtrusiveness:
 
-- ~perf_events~
-- hardware breakpoints
-- systemtap
-- ftrace
 - ptrace
+- ftrace
+- systemtap
+- ~perf_events~
 
 #+BEGIN_NOTES
 - We can use perf and other out-of-VM tools to get ideas of what we can try optimizing
@@ -82,6 +84,49 @@ In order of obtrusiveness:
   things into death spirals
 #+END_NOTES
 
+* systemtap
+
+- scripting language -> kernel module
+- no brakes
+
+** GC probes
+
+#+BEGIN_EXAMPLE
+    /**
+     * Fired when a major GC is starting.
+     *
+     * @param p the PID (string form) of the exiting process
+     * @param need the number of words needed on the heap
+     */
+    probe gc_major__start(char *p, int need);
+
+    /**
+     * Fired when a minor GC is starting.
+     *
+     * @param p the PID (string form) of the exiting process
+     * @param need the number of words needed on the heap
+     */
+    probe gc_minor__start(char *p, int need);
+#+END_EXAMPLE
+
+** Process heap changes
+
+~lib/runtime_tools/examples/memory1.systemtap~
+
+#+BEGIN_EXAMPLE
+probe process("beam").mark("process-heap_grow")
+{
+    printf("proc heap grow pid %s %d -> %d bytes\n", user_string($arg1),
+           $arg2, $arg3);
+}
+
+probe process("beam").mark("process-heap_shrink")
+{
+    printf("proc heap shrink pid %s %d -> %d bytes\n", user_string($arg1),
+           $arg2, $arg3);
+}
+#+END_EXAMPLE
+
 * ~perf_events~
 
 - can sample registers and stack from kernel
@@ -93,14 +138,273 @@ In order of obtrusiveness:
 
 * perf has overhead, too
 
-[[http://web.eece.maine.edu/~vweaver/projects/perf_events/overhead/][V.M. Weaver. "Self-monitoring Overhead of the Linux perf_event Performance Counter Interface", IEEE International Symposium on Performance Analysis of Systems and Software (ISPASS 2015), Philadelphia, Pennsylvania, March 2015.]]
+[[http://web.eece.maine.edu/~vweaver/projects/perf_events/overhead/][V.M. Weaver. "Self-monitoring Overhead of the Linux ~perf_event~ Performance Counter Interface", IEEE International Symposium on Performance Analysis of Systems and Software (ISPASS 2015), Philadelphia, Pennsylvania, March 2015.]]
 
+* Information we can get just from existing tools
+
+- native traces are still useful; tell us a lot about the workload
+
+#+BEGIN_NOTES
+perf top here
+flamegraph
+show some classic issues
+#+END_NOTES
+
+** perf top
+
+#+BEGIN_EXAMPLE
+    16.61%  beam.smp                                          [.] process_main
+     3.00%  beam.smp                                          [.] 0x00000000000d9a3e
+     2.92%  beam.smp                                          [.] 0x00000000000d9a44
+     2.07%  beam.smp                                          [.] copy_shallow
+     1.78%  beam.smp                                          [.] schedule
+     1.63%  booleans_1473100378-465242-576460752303408164.so  [.] evaluate
+     1.48%  beam.smp                                          [.] copy_struct
+     1.15%  jiffy.so                                          [.] encode_iter
+     1.01%  libpthread-2.21.so                                [.] pthread_mutex_lock
+     0.96%  beam.smp                                          [.] erts_garbage_collect
+     0.91%  beam.smp                                          [.] erts_alcu_check_delayed_dealloc
+     0.89%  beam.smp                                          [.] eq
+     0.84%  beam.smp                                          [.] size_object
+     0.84%  beam.smp                                          [.] erts_alcu_alloc_thr_pref
+     0.81%  beam.smp                                          [.] erts_alcu_free_thr_pref
+     0.78%  beam.smp                                          [.] db_get_hash
+     0.74%  libpthread-2.21.so                                [.] pthread_getspecific
+     0.72%  libc-2.21.so                                      [.] vfprintf
+     0.70%  beam.smp                                          [.] 0x00000000000d9a2f
+     0.57%  [kernel]                                          [k] system_call
+     0.53%  beam.smp                                          [.] 0x00000000000d9a34
+     0.48%  libpthread-2.21.so                                [.] __pthread_mutex_unlock_usercnt
+#+END_EXAMPLE
+
+** flame graphs
+
+* See also
+
+- [[http://www.brendangregg.com/linuxperf.html][Brendan Gregg]]
+- [[http://stuff-gil-says.blogspot.ca/][Gil Tene]]
+
+* Disclaimer: hacks ahead
+
+* How can we get Erlang stack traces intermixed with native ones?
+
+- sample registers and stack
+- unwind (printing native frames) till we find ~process_main()~
+- DWARF info (or perf sample) gives us registers that correspond to ~c_p~; also ~E~ and ~I~ if we're lucky
+- walk ~c_p->stop~ exactly as ~etp~ does
+
+** struct process
+
+#+BEGIN_EXAMPLE
+struct process {
+    ErtsPTabElementCommon common; /* *Need* to be first in struct */
+
+    /* All fields in the PCB that differs between different heap
+     * architectures, have been moved to the end of this struct to
+     * make sure that as few offsets as possible differ. Different
+     * offsets between memory architectures in this struct, means that
+     * native code have to use functions instead of constants.
+     */
+
+    Eterm* htop;                /* Heap top */
+    Eterm* stop;                /* Stack top */
+    Eterm* heap;                /* Heap start */
+    Eterm* hend;                /* Heap end */
+    Uint heap_sz;               /* Size of heap in words */
+    Uint min_heap_size;         /* Minimum size of heap (in words). */
+    Uint min_vheap_size;        /* Minimum size of virtual heap (in words). */
+
+#if !defined(NO_FPE_SIGNALS) || defined(HIPE)
+    volatile unsigned long fp_exception;
+#endif
+
+#ifdef HIPE
+    /* HiPE-specific process fields. Put it early in struct process,
+       to enable smaller & faster addressing modes on the x86. */
+    struct hipe_process_state hipe;
+#endif
+
+    /*
+     * Saved x registers.
+     */
+    Uint arity;                 /* Number of live argument registers (only valid
+                                 * when process is *not* running).
+                                 */
+    Eterm* arg_reg;             /* Pointer to argument registers. */
+    unsigned max_arg_reg;       /* Maximum number of argument registers available. */
+    Eterm def_arg_reg[6];       /* Default array for argument registers. */
+
+    BeamInstr* cp;              /* (untagged) Continuation pointer (for threaded code). */
+    BeamInstr* i;               /* Program counter for threaded code. */
+    Sint catches;               /* Number of catches on stack */
+    Sint fcalls;                /*
+                                 * Number of reductions left to execute.
+                                 * Only valid for the current process.
+                                 */
+    Uint32 rcount;              /* suspend count */
+    int  schedule_count;        /* Times left to reschedule a low prio process */
+    Uint reds;                  /* No of reductions for this process  */
+    Eterm group_leader;         /* Pid in charge
+                                   (can be boxed) */
+    Uint flags;                 /* Trap exit, etc (no trace flags anymore) */
+    Eterm fvalue;               /* Exit & Throw value (failure reason) */
+    Uint freason;               /* Reason for detected failure */
+    Eterm ftrace;               /* Latest exception stack trace dump */
+
+    Process *next;              /* Pointer to next process in run queue */
+
+    struct ErtsNodesMonitor_ *nodes_monitors;
+
+    ErtsSuspendMonitor *suspend_monitors; /* Processes suspended by
+                                             this process via
+                                             erlang:suspend_process/1 */
+
+    ErlMessageQueue msg;        /* Message queue */
+
+    ErtsBifTimers *bif_timers;  /* Bif timers aiming at this process */
+#ifdef ERTS_BTM_ACCESSOR_SUPPORT
+    ErtsBifTimers *accessor_bif_timers; /* Accessor bif timers */
+#endif
+
+    ProcDict  *dictionary;       /* Process dictionary, may be NULL */
+
+    Uint seq_trace_clock;
+    Uint seq_trace_lastcnt;
+    Eterm seq_trace_token;      /* Sequential trace token (tuple size 5 see below) */
+
+#ifdef USE_VM_PROBES
+    Eterm dt_utag;              /* Place to store the dynamc trace user tag */
+    Uint dt_utag_flags;         /* flag field for the dt_utag */
+#endif
+    union {
+        void *terminate;
+        BeamInstr initial[3];   /* Initial module(0), function(1), arity(2), often used instead
+                                   of pointer to funcinfo instruction, hence the BeamInstr datatype */
+    } u;
+    BeamInstr* current;         /* Current Erlang function, part of the funcinfo:
+                                 * module(0), function(1), arity(2)
+                                 * (module and functions are tagged atoms;
+                                 * arity an untagged integer). BeamInstr * because it references code
+                                 */
+
+    /*
+     * Information mainly for post-mortem use (erl crash dump).
+     */
+    Eterm parent;               /* Pid of process that created this process. */
+    erts_approx_time_t approx_started; /* Time when started. */
+
+    Uint32 static_flags;        /* Flags that do *not* change */
+
+    /* This is the place, where all fields that differs between memory
+     * architectures, have gone to.
+     */
+
+    Eterm *high_water;
+    Eterm *old_hend;            /* Heap pointers for generational GC. */
+    Eterm *old_htop;
+    Eterm *old_heap;
+    Uint16 gen_gcs;             /* Number of (minor) generational GCs. */
+    Uint16 max_gen_gcs;         /* Max minor gen GCs before fullsweep. */
+    ErlOffHeap off_heap;        /* Off-heap data updated by copy_struct(). */
+    ErlHeapFragment* mbuf;      /* Pointer to message buffer list */
+    Uint mbuf_sz;               /* Size of all message buffers */
+    ErtsPSD *psd;               /* Rarely used process specific data */
+
+    Uint64 bin_vheap_sz;        /* Virtual heap block size for binaries */
+    Uint64 bin_vheap_mature;    /* Virtual heap block size for binaries */
+    Uint64 bin_old_vheap_sz;    /* Virtual old heap block size for binaries */
+    Uint64 bin_old_vheap;       /* Virtual old heap size for binaries */
+
+    ErtsProcSysTaskQs *sys_task_qs;
+
+    erts_smp_atomic32_t state;  /* Process state flags (see ERTS_PSFLG_*) */
+
+#ifdef ERTS_SMP
+    ErlMessageInQueue msg_inq;
+    ErtsPendExit pending_exit;
+    erts_proc_lock_t lock;
+    ErtsSchedulerData *scheduler_data;
+    Eterm suspendee;
+    ErtsPendingSuspend *pending_suspenders;
+    erts_smp_atomic_t run_queue;
+#ifdef HIPE
+    struct hipe_process_state_smp hipe_smp;
+#endif
+#endif
+
+#ifdef CHECK_FOR_HOLES
+    Eterm* last_htop;           /* No need to scan the heap below this point. */
+    ErlHeapFragment* last_mbuf; /* No need to scan beyond this mbuf. */
+#endif
+
+#ifdef DEBUG
+    Eterm* last_old_htop;       /*
+                                 * No need to scan the old heap below this point
+                                 * when looking for invalid pointers into the new heap or
+                                 * heap fragments.
+                                 */
+#endif
+
+#ifdef FORCE_HEAP_FRAGS
+    Uint space_verified;        /* Avoid HAlloc forcing heap fragments when */
+    Eterm* space_verified_from; /* we rely on available heap space (TestHeap) */
+#endif
+};
+#+END_EXAMPLE
+
+** ~process_main~
+
+#+BEGIN_EXAMPLE
+(gdb) disassemble/m process_main
+Dump of assembler code for function process_main:
+1128        static int init_done = 0;
+1129        Process* c_p = NULL;
+1130        int reds_used;
+[...]
+1145        /*
+1146         * Top of heap (next free location); grows upwards.
+1147         */
+1148        register Eterm* HTOP REG_htop = NULL;
+1149
+1150        /* Stack pointer.  Grows downwards; points
+1151         * to last item pushed (normally a saved
+1152         * continuation pointer).
+1153         */
+1154        register Eterm* E REG_stop = NULL;
+1155
+1156        /*
+1157         * Pointer to next threaded instruction.
+1158         */
+1159        register BeamInstr *I REG_I = NULL;
+1160
+1161        /* Number of reductions left.  This function
+1162         * returns to the scheduler when FCALLS reaches zero.
+1163         */
+1164        register Sint FCALLS REG_fcalls = 0;
+[...]
+1311            SWAPIN;
+   0x000000000043e015 <+533>:   mov    0x48(%r13),%r11
+   0x000000000043e01c <+540>:   mov    0x50(%r13),%r10
+   0x000000000043e020 <+544>:   jmpq   *(%rbx)
+   0x000000000043e022 <+546>:   lea    0x2c8(%r13),%rdx
+#+END_EXAMPLE
+
+~objdump -d -S beam.smp~:
+#+BEGIN_EXAMPLE
+         I = handle_error(c_p, I, reg, NULL);
+  43e16b:       48 89 de                mov    %rbx,%rsi
+  43e16e:       4c 89 f2                mov    %r14,%rdx
+  43e171:       4c 89 ef                mov    %r13,%rdi
+  43e174:       e8 27 f2 ff ff          callq  43d3a0 <handle_error.constprop.3>
+  43e179:       48 89 c3                mov    %rax,%rbx
+#+END_EXAMPLE
 * ~process_vm_readv~
 
 - reads from another process's memory without stopping it
 - unsafe (racy), but unobtrusive
 
 * DWARF
+
 
 - allows us to peek into ERTS at the C level
 - libraries aren't great
@@ -112,6 +416,88 @@ In order of obtrusiveness:
 The existing libraries are very focused on a handful of use-cases,
 like implementing gdb and nm.
 #+END_NOTES
+
+
+** local variables
+
+#+BEGIN_EXAMPLE
+ [  b94e]    subprogram
+             external             (flag_present) Yes
+             name                 (strp) "process_main"
+             decl_file            (data1) 1
+             decl_line            (data2) 1126
+             prototyped           (flag_present) Yes
+             low_pc               (addr) 0x000000000043de00 <process_main>
+             high_pc              (data8) 47338 (0x00000000004496ea)
+             frame_base           (exprloc)
+              [   0] call_frame_cfa
+             GNU_all_tail_call_sites (flag_present) Yes
+             sibling              (ref4) [ 147b1]
+ [  b96c]      variable
+               name                 (strp) "init_done"
+               decl_file            (data1) 1
+               decl_line            (data2) 1128
+               type                 (ref4) [  3d95]
+               location             (exprloc)
+                [   0] addr 0x8f6a7c <init_done.23024>
+ [  b982]      variable
+               name                 (string) "c_p"
+               decl_file            (data1) 1
+               decl_line            (data2) 1129
+               type                 (ref4) [  5d64]
+ [  b98e]      variable
+               name                 (strp) "reds_used"
+               decl_file            (data1) 1
+               decl_line            (data2) 1130
+               type                 (ref4) [  3d95]
+               location             (exprloc)
+                [   0] reg12
+ [  b99c]      variable
+               name                 (string) "x0"
+               decl_file            (data1) 1
+               decl_line            (data2) 1138
+               type                 (ref4) [  461b]
+               location             (exprloc)
+                [   0] reg15
+#+END_EXAMPLE
+
+** unwind information
+
+#+BEGIN_EXAMPLE
+ [   7f8] FDE length=68 cie=[    30]
+   CIE_pointer:              1996
+   initial_location:         0x000000000043de00 <process_main> (offset: 0x3de00)
+   address_range:            0xb8ea (end offset: 0x496ea)
+
+   Program:
+     advance_loc 5 to 0x3de05
+     def_cfa r10 (reg10) at offset 0
+     advance_loc 9 to 0x3de0e
+     expression r6 (reg6)
+          [   0] breg6 0
+     advance_loc 13 to 0x3de1b
+     def_cfa_expression 3
+          [   0] breg6 -40
+          [   2] deref
+     expression r15 (reg15)
+          [   0] breg6 -8
+     expression r14 (reg14)
+          [   0] breg6 -16
+     expression r13 (reg13)
+          [   0] breg6 -24
+     expression r12 (reg12)
+          [   0] breg6 -32
+     advance_loc 8 to 0x3de23
+     expression r3 (reg3)
+          [   0] breg6 -48
+     advance_loc2 47258 to 0x496bd
+     remember_state
+     def_cfa r10 (reg10) at offset 0
+     advance_loc 13 to 0x496ca
+     def_cfa r7 (reg7) at offset 8
+     advance_loc 1 to 0x496cb
+     restore_state
+#+END_EXAMPLE
 
 * Generating a perf.map
 
@@ -129,6 +515,22 @@ like implementing gdb and nm.
 7fe15be50fb8 78 cowboy_app:module_info/1
 #+END_EXAMPLE
 
+erts/emulator/beam/beam_ranges.c
+#+BEGIN_EXAMPLE
+/*
+ * The following variables keep a sorted list of address ranges for
+ * each module.  It allows us to quickly find a function given an
+ * instruction pointer.
+ */
+struct ranges {
+    Range* modules;            /* Sorted lists of module addresses. */
+    Sint n;                    /* Number of range entries. */
+    Sint allocated;            /* Number of allocated entries. */
+    erts_smp_atomic_t mid;     /* Cached search start point */
+};
+static struct ranges r[ERTS_NUM_CODE_IX];
+#+END_EXAMPLE
+
 #+BEGIN_NOTES
 Not strictly necessary, but convenient, especially for minimizing the
 modifications to the perf tool itself.
@@ -136,16 +538,13 @@ modifications to the perf tool itself.
 The VM could do this for us.
 #+END_NOTES
 
-* How can we get Erlang stack traces intermixed with native ones?
-
-- sample registers and stack
-- unwind (printing native frames) till we find ~process_main()~
-- DWARF info (or perf sample) gives us registers that correspond to ~c_p~; also ~E~ and ~I~ if we're lucky
-- walk ~c_p->stop~ exactly as ~etp~ does
-
 * How bad is the skid?
 
-(measurements here)
+Depends on the buffer, machine, sampling frequency, et cetera, but
+(when we're forced to read from the process) can range from a few
+hundred microseconds to several seconds (!)
+
+Probably wise to discard samples older than a millisecond.
 
 #+BEGIN_NOTES
 - measurements here
@@ -167,6 +566,8 @@ The VM could do this for us.
 
 * Linking experiments
 
+[[./linking-experiments.svg]]
+
 #+BEGIN_NOTES
 - now we can conduct experiments in the small, and try to demonstrate a correlation
 - identify KPI: what is measured improves
@@ -181,19 +582,9 @@ The VM could do this for us.
   confidence in our server and send it more load
 #+END_NOTES
 
-* Beware Goodhart's Law
+* KPIs
 
-#+BEGIN_QUOTE
-When a measure becomes a target, it ceases to be a good measure.
- — Goodhart's Law
-#+END_QUOTE
-
-* Making benchmarks more honest
-
-#+BEGIN_QUOTE
-Why not 10x?
-  — Brendan Gregg
-#+END_QUOTE
+[[./graphs-for-kpis.jpg]]
 
 * Idea: Intentionally slow suspected paths
 
@@ -201,6 +592,13 @@ Why not 10x?
 - also the basis of coz profiler
 - slow things down to demonstrate correlations before we try to speed things up
 #+END_NOTES
+
+* Beware Goodhart's Law
+
+#+BEGIN_QUOTE
+When a measure becomes a target, it ceases to be a good measure.
+ — Goodhart's Law
+#+END_QUOTE
 
 * Allocator stats
 
@@ -216,7 +614,27 @@ Why not 10x?
 * Who triggers garbage collections?
 
 #+BEGIN_EXAMPLE
-erlang-blame erts_garbage_collect PID
+$ erlang-sample -d 60 --blame erts_garbage_collect 17598
+1057    rtb_lib_indexer:get_entry/3
+1011    bertconf:read/2
+64      jiffy:nif_encode_init/2
+63      rtb_gateway_exchange:request/2
+44      jiffy:nif_encode_iter/3
+36      cowboy_protocol:parse_hd_value/9
+31      statsderl:maybe_cast/4
+26      cowboy_protocol:parse_hd_name/8
+25      lists:reverse/1
+20      rtb_gateway_pacing:explode_pacings/2
+15      cowboy_protocol:wait_request/3
+14      rtb_gateway_swirl:-filtered/3-lc$^0/1-0-/3
+14      rtb_gateway_pacing:-pacings/1-fun-0-/2
+13      rtb_gateway_swirl:emit/2
+13      shackle_queue:remove/2
+13      cowboy_req:parse_header/4
+12      rtb_gateway_cache:read/4
+12      cowboy_protocol:parse_host/3
+11      cowboy_req:reply/4
+[...]
 #+END_EXAMPLE
 
 - same as ordinary sampling, but only count processes or functions
@@ -226,18 +644,36 @@ erlang-blame erts_garbage_collect PID
 #+BEGIN_NOTES
 #+END_NOTES
 
-* Live demo
-* Other tricks
+* A hack too far
 
-- printing the current stack on each scheduler
-- kcov for coverage in production
+#+BEGIN_SRC c
+pid_t spy_pid;
+uintptr_t spy_ptr;
+
+static void *spy_fn(void)
+{
+    spy_pid = syscall(__NR_gettid);
+    sched_setscheduler(spy_pid, SCHED_IDLE, &(struct sched_param){.sched_priority=20});
+    asm volatile("" ::: "memory");
+    asm volatile ("forever:\n"
+                  "movq %0, %%rsp\n"
+                  "movl %1, %%eax\n"
+                  "int $0x80\n"
+                  "jmp forever\n"
+                  : : "m" (spy_ptr), "r" (__NR_sched_yield) : "rsp");
+    __builtin_unreachable();
+}
+#+END_SRC
+
 
 * Things to improve
 
-- reduce skid
+- make tools easier to use
+- reduce skid, more correctness checks
 - better debug info
-- sample less
-- use BPF?
+- [[https://simonkagstrom.github.io/kcov/][kcov]] for coverage in production
+  - maybe with [[http://www.halobates.de/pt-tracing-summit15.pdf][Processor Trace]]
+- BPF + SystemTap = safe ustack helpers?
 
 #+BEGIN_NOTES
 right now we sample a lot of registers and memory that we are only
